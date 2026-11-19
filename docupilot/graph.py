@@ -40,6 +40,7 @@ from .errors import DocuPilotError, friendly_error, is_transient
 from .keyword_search import as_int
 from .schemas import GroundingGrade, RelevanceGrades, RewrittenQuery, RouteDecision, StandaloneQuestion
 from .vectorstore import Retriever
+from . import guardrails, hr_answers
 from .web import WebSearch
 
 HISTORY_WINDOW = 6  # messages of history used to resolve follow-ups
@@ -179,6 +180,7 @@ def build_graph(
     checkpointer: Any | None = None,
     classifier: QuestionClassifier | None = None,
     on_llm_route: Callable[[str, str], None] | None = None,
+    hr_tools: Any | None = None,
 ):
     s = settings or get_settings()
     answer_llm = _retrying(llm)
@@ -201,6 +203,14 @@ def build_graph(
         }
 
     def route(state: RAGState) -> RAGState:
+        raw = state.get("question", "")
+        if guardrails.is_injection(raw):
+            return {"route": "refuse", "trace": _add_trace(state, "guardrail: prompt injection blocked")}
+        question = state["standalone_question"]
+        if guardrails.is_off_topic(question):
+            return {"route": "refuse", "trace": _add_trace(state, "guardrail: off-topic, refused")}
+        if hr_tools is not None and guardrails.is_hr_it(question) and hr_answers.plan_calls(question):
+            return {"route": "hr", "trace": _add_trace(state, "route: hr (database via MCP, no LLM call)")}
         question = state["standalone_question"]
         shortcut = keyword_route(question) if s.keyword_routing else None
         predicted, confidence = classifier(question) if (classifier and not shortcut) else (None, 0.0)
@@ -331,6 +341,19 @@ def build_graph(
         answer = _text(msg).strip()
         return {"answer": answer, "sources": [], "grounded": None, "messages": [AIMessage(answer)]}
 
+    def hr_lookup(state: RAGState) -> RAGState:
+        calls = hr_answers.plan_calls(state["standalone_question"])
+        results = hr_tools.call_many(calls)
+        answer, cards = hr_answers.format_answer(calls, results)
+        return {"answer": answer, "sources": cards, "grounded": True, "route": "hr",
+                "messages": [AIMessage(answer)],
+                "trace": _add_trace(state, f"called MCP tools: {', '.join(c[0] for c in calls)}")}
+
+    def refuse(state: RAGState) -> RAGState:
+        injected = guardrails.is_injection(state.get("question", ""))
+        msg = guardrails.REFUSAL_INJECTION if injected else guardrails.REFUSAL_OFF_TOPIC
+        return {"answer": msg, "sources": [], "grounded": None, "messages": [AIMessage(msg)]}
+
     def no_answer(state: RAGState) -> RAGState:
         return {
             "answer": prompts.NO_ANSWER,
@@ -346,13 +369,15 @@ def build_graph(
         ("retrieve", retrieve), ("grade_documents", grade_documents), ("rewrite_query", rewrite_query),
         ("web_search", web), ("generate", generate), ("check_grounding", check_grounding),
         ("finalize", finalize), ("direct_answer", direct_answer), ("no_answer", no_answer),
+        ("hr_lookup", hr_lookup), ("refuse", refuse),
     ]:
         g.add_node(name, fn)
 
     g.add_edge(START, "contextualize")
     g.add_edge("contextualize", "route")
     g.add_conditional_edges("route", lambda st: st["route"],
-                            {"retrieve": "retrieve", "document": "load_documents", "direct": "direct_answer"})
+                            {"retrieve": "retrieve", "document": "load_documents", "direct": "direct_answer",
+                                         "hr": "hr_lookup", "refuse": "refuse"})
     g.add_conditional_edges("load_documents", after_load, ["generate", "retrieve"])
     g.add_edge("retrieve", "grade_documents")
     g.add_conditional_edges("grade_documents", after_grading,
@@ -364,6 +389,8 @@ def build_graph(
     g.add_edge("finalize", END)
     g.add_edge("direct_answer", END)
     g.add_edge("no_answer", END)
+    g.add_edge("hr_lookup", END)
+    g.add_edge("refuse", END)
 
     return g.compile(checkpointer=checkpointer if checkpointer is not None else InMemorySaver())
 
@@ -409,6 +436,7 @@ class DocuPilot:
                 checkpointer=checkpointer,
                 classifier=_load_classifier(self.settings),
                 on_llm_route=record_learned if self.settings.router_learning else None,
+                hr_tools=_hr_client(self.settings),
             )
             if cache is None and self.settings.answer_cache:
                 from .cache import AnswerCache
@@ -495,7 +523,7 @@ class DocuPilot:
 
         final = self.graph.get_state(config).values
         result.update(
-            answer=final.get("answer", ""),
+            answer=guardrails.redact(final.get("answer", "")),
             sources=final.get("sources", []),
             grounded=final.get("grounded"),
             used_web=final.get("used_web", False),
@@ -517,6 +545,13 @@ class DocuPilot:
 
 
 STREAMED_NODES = {"generate", "direct_answer"}
+
+
+def _hr_client(settings: Settings):
+    if not settings.database_url:
+        return None
+    from .mcp_client import StdioMCPClient
+    return StdioMCPClient(env={"DATABASE_URL": settings.database_url})
 
 
 def _cacheable(result: dict) -> bool:

@@ -99,6 +99,9 @@ class Settings:
     tavily_api_key: str | None = field(default_factory=lambda: os.getenv("TAVILY_API_KEY"))
     web_fallback: bool = field(default_factory=lambda: _bool("WEB_FALLBACK", True))
 
+    # HR / IT database (Postgres, read through the MCP server). Off when DATABASE_URL is unset.
+    database_url: str | None = field(default_factory=lambda: os.getenv("DATABASE_URL") or None)
+
     # Local storage: document registry, full texts, chat history, feedback
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "storage")))
 
